@@ -1,0 +1,256 @@
+#include <WiFiClientSecure.h>
+#include <Firebase_ESP_Client.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+const char* botToken = "7647504514:AAFPIkrJ2JKGhbLB5Wm13EEQc9UEONcN8ow";
+const char* chatID = "5939840029";
+
+void sendTelegramMessage(const String& message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + message;
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      Serial.printf("[Telegram] Message sent: %s\n", message.c_str());
+    } else {
+      Serial.printf("[Telegram] Failed to send: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+}
+
+uint8_t senderMac[] = {0x3C, 0x8A, 0x1F, 0x9B, 0xCB, 0x5C};
+
+const char* ssid = "PottyWifi";
+const char* password = "tara tumae tayo";
+
+#define FIREBASE_HOST "https://passwords-c0497-default-rtdb.firebaseio.com/"
+#define FIREBASE_API_KEY "AIzaSyDFzTAbQxn_ilBsj6DkV4-UvVpA45k5rV0"
+
+constexpr int LOCK_PIN = 4;          
+constexpr int IR_PIN = 33;
+constexpr int MAGNETIC_PIN = 27;
+constexpr int BUZZER_PIN = 15;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+volatile int lockState = 0;
+volatile int irState = 0;
+bool signedUp = false;
+unsigned long lastFirebaseCheck = 0;
+
+typedef struct {
+  char message[32];
+} struct_message;
+
+struct_message incomingData;
+
+void firebaseReadTask(void* parameter);
+void irSensorTask(void* parameter);
+void doorStatusTask(void* parameter);
+void connectWiFi();
+void setLockState(int state);
+void updateFirebaseLockState(const char* state);
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LOCK_PIN, OUTPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(MAGNETIC_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  setLockState(0);
+
+  connectWiFi();
+
+  config.api_key = FIREBASE_API_KEY;
+  config.database_url = FIREBASE_HOST;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase signed up");
+    signedUp = true;
+  } else {
+    Serial.printf("SignUp error: %s\n", config.signer.signupError.message.c_str());
+  }
+
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (Firebase.RTDB.getString(&fbdo, "/Lock/state")) {
+    lockState = fbdo.stringData().toInt();
+    setLockState(lockState);
+    Serial.printf("Initial lock state: %s\n", lockState == 1 ? "Unlocked" : "Locked");
+  } else {
+    setLockState(0);
+    updateFirebaseLockState("0");
+    Serial.println("Initial lock state set to: Locked");
+  }
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true) { delay(1000); }
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, senderMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW peer");
+  }
+
+  xTaskCreatePinnedToCore(firebaseReadTask, "FirebaseRead", 8192, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(irSensorTask, "IRSensor", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(doorStatusTask, "DoorStatus", 4096, NULL, 2, NULL, 1);
+}
+
+void loop() {
+  delay(100);
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2],
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+  Serial.printf("ESP-NOW data received from: %s\n", macStr);
+
+  if (len != sizeof(struct_message)) {
+    Serial.println("Invalid ESP-NOW message length");
+    return;
+  }
+
+  memcpy(&incomingData, data, sizeof(incomingData));
+  Serial.printf("Message: %s\n", incomingData.message);
+
+  if (strcmp(incomingData.message, "LOCK") == 0) {
+    setLockState(0);
+    updateFirebaseLockState("0");
+    sendTelegramMessage("Door LOCKED");
+  } else if (strcmp(incomingData.message, "UNLOCK") == 0) {
+    setLockState(1);
+    updateFirebaseLockState("1");
+    sendTelegramMessage("Door UNLOCKED");
+  }
+}
+
+void firebaseReadTask(void* parameter) {
+  while (true) {
+    if (signedUp && Firebase.ready() && (millis() - lastFirebaseCheck > 1000)) {
+      lastFirebaseCheck = millis();
+      if (Firebase.RTDB.getString(&fbdo, "/Lock/state")) {
+        int cloudState = fbdo.stringData().toInt();
+        if (cloudState != lockState) {
+          lockState = cloudState;
+          setLockState(lockState);
+          Serial.printf("Lock state updated from Firebase: %s\n", lockState == 1 ? "Unlocked" : "Locked");
+
+         
+          if (lockState == 1) {
+            sendTelegramMessage("Door UNLOCKED via App");
+          } else {
+            sendTelegramMessage("Door LOCKED via App");
+          }
+        }
+      }
+    }
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+void irSensorTask(void* parameter) {
+  int lastIRState = HIGH;
+  while (true) {
+    irState = digitalRead(IR_PIN);
+    if (irState == LOW && lastIRState == HIGH && lockState == 0) {
+      setLockState(1);
+      updateFirebaseLockState("1");
+      Serial.println("IR sensor triggered: Unlocking door");
+      sendTelegramMessage("IR triggered - Door temporarily UNLOCKED");
+
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+      setLockState(0);
+      updateFirebaseLockState("0");
+      sendTelegramMessage("Auto-lock engaged after IR access");
+    }
+    lastIRState = irState;
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+void doorStatusTask(void* parameter) {
+  int lastDoorState = digitalRead(MAGNETIC_PIN);
+  while (true) {
+    int currentDoorState = digitalRead(MAGNETIC_PIN);
+    if (currentDoorState != lastDoorState) {
+      if (currentDoorState == LOW) {
+        Serial.println("Door CLOSED");
+        digitalWrite(BUZZER_PIN, LOW);
+        sendTelegramMessage("Door CLOSED");
+      } else {
+        Serial.println("Door OPEN");
+        sendTelegramMessage("Door OPENED");
+
+        if (lockState == 0) {
+          digitalWrite(BUZZER_PIN, HIGH);
+          Serial.println("!!! FORCED ENTRY DETECTED !!!");
+          sendTelegramMessage("Possible Intruder! Door opened while LOCKED");
+        } else {
+          digitalWrite(BUZZER_PIN, LOW);
+        }
+      }
+      lastDoorState = currentDoorState;
+    }
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+void setLockState(int state) {
+  digitalWrite(LOCK_PIN, state == 1 ? HIGH : LOW);
+  lockState = state;
+}
+
+void updateFirebaseLockState(const char* state) {
+  if (Firebase.ready() && WiFi.status() == WL_CONNECTED) {
+    Firebase.RTDB.setString(&fbdo, "/Lock/state", state);
+  }
+}
+
+void connectWiFi() {
+  Serial.printf("Connecting to WiFi SSID: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  const int maxAttempts = 20;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("WiFi failed to connect.");
+  }
+}
